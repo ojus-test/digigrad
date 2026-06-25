@@ -1969,6 +1969,16 @@ async def twilio_stream(websocket: fastapi.WebSocket):
     # lower toward 0 to make it more eager.
     barge_guard_s = _env_float("BARGE_IN_GUARD_S", 1.0)
     agent_turn = {"start": 0.0, "last": 0.0}  # monotonic timestamps for turn tracking
+    # Tool window: while a tool (e.g. web_search) is running and briefly after,
+    # gradbot flags the answer-turn's first audio frame as `interrupted` because
+    # the new generation replaces the preamble/filler. Without this guard the
+    # barge-in handler would read that as a caller talking over the clone and
+    # flush Twilio's buffer, cutting the preamble off mid-word before the result
+    # is spoken. Suppressing barge-in during this window lets the current TTS
+    # finish smoothly and the result follow. Covers web_search's 8s timeout + a
+    # margin for the answer's first frames.
+    tool_window = {"until": 0.0}
+    tool_window_s = _env_float("TOOL_BARGE_SUPPRESS_S", 12.0)
 
     async def _maybe_play_filler() -> None:
         await asyncio.sleep(_FILLER_DELAY_S)
@@ -2028,7 +2038,10 @@ async def twilio_stream(websocket: fastapi.WebSocket):
                     nonlocal agent_resample_state
                     now = time.monotonic()
                     interrupted = barge_in_on and getattr(msg, "interrupted", False)
-                    if (interrupted and agent_turn["start"]
+                    # Don't treat the agent's own post-tool continuation as a
+                    # caller barge-in (see tool_window note above).
+                    in_tool_window = now < tool_window["until"]
+                    if (interrupted and not in_tool_window and agent_turn["start"]
                             and (now - agent_turn["start"]) >= barge_guard_s):
                         # Genuine barge-in (past the guard window): drop the
                         # agent audio Twilio still has queued so the clone stops,
@@ -2123,6 +2136,9 @@ async def twilio_stream(websocket: fastapi.WebSocket):
 
                 elif kind == "tool_call":
                     handle = gradbot.ToolHandle(msg.tool_call_handle, msg.tool_call)
+                    # Suppress barge-in around the tool so the answer-turn doesn't
+                    # flush the in-progress preamble/filler (see tool_window note).
+                    tool_window["until"] = time.monotonic() + tool_window_s
                     task = asyncio.create_task(_handle_tool_call(handle, state, emit_event))
                     pending_tool_tasks.add(task)
                     task.add_done_callback(pending_tool_tasks.discard)
