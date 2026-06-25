@@ -1000,17 +1000,32 @@ async def _handle_tool_call(handle, state: _CallState, send_event) -> None:
         raw_to = (args.get("to") or "").strip()
         digits = "".join(ch for ch in raw_to if ch.isdigit())
         task = (args.get("task") or "").strip()
+        business = (args.get("business_name") or "").strip()
+        # Receipt so place_call is debuggable from the logs (like web_search):
+        # the request, then its outcome (no_number / no_task / not_allowed /
+        # dispatch_error / ok + room).
+        log.info(
+            "call %s | place_call to=%r business=%r task=%r",
+            state.room_name, raw_to, business[:80], task[:120],
+        )
         if not digits:
+            log.warning("call %s | place_call REFUSED: no valid phone number (to=%r)",
+                        state.room_name, raw_to)
             await handle.send_error(
                 "Refused: no valid phone number. Look the business up with web_search "
                 "first, then call place_call with its number in E.164 (e.g. +1…)."
             )
             return
         if not task:
+            log.warning("call %s | place_call REFUSED: no task", state.room_name)
             await handle.send_error("Refused: no task — say what the call should accomplish.")
             return
         to = "+" + digits
         if not _outbound_destination_allowed(to):
+            log.warning(
+                "call %s | place_call REFUSED: %s not allowed (set OUTBOUND_ALLOWLIST "
+                "or ALLOW_ARBITRARY_OUTBOUND)", state.room_name, to,
+            )
             _timeline_event(state, "place_call", to=to, error="not_allowed")
             await handle.send_json({
                 "success": False,
@@ -1022,22 +1037,25 @@ async def _handle_tool_call(handle, state: _CallState, send_event) -> None:
         sub_spec = BusinessCallSpec(
             task=task,
             language=lang,
-            business_name=(args.get("business_name") or "").strip(),
+            business_name=business,
             destination=to,
             allow_booking=bool(args.get("allow_booking", False)),
             mode="business",
         )
         out = await dispatch_gradbot_call(to=to, spec=sub_spec, tenant_id=state.tenant_id)
         if isinstance(out, str) and out.startswith("Error:"):
+            log.warning("call %s | place_call DISPATCH FAILED to=%s: %s",
+                        state.room_name, to, out)
             _timeline_event(state, "place_call", to=to, error=out[:120])
             await handle.send_json({
                 "success": False,
                 "error": "Couldn't place the call — tell the caller it didn't go through.",
             })
             return
+        log.info("call %s | place_call OK to=%s room=%s", state.room_name, to, out)
         _timeline_event(
             state, "place_call", to=to, room=out,
-            business=sub_spec.business_name[:80] or task[:80],
+            business=business[:80] or task[:80],
         )
         await _append_transcript(state, "PLACE-CALL", f"{to} — {task}")
         await handle.send_json({
